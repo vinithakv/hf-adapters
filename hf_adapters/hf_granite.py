@@ -33,6 +33,7 @@ from hf_adapters.hf_common import (
     _SDPA_MAX_SEQUENCE_TILE_SIZE,
     embed_text_tokens,
     get_backbone,
+    padded_attention_stays_on_host,
     prepare_lm_head_for_spyre,
     prepare_rope_and_heads,
     prepare_standard_gqa_blocks,
@@ -46,6 +47,10 @@ SPYRE_SUPPORTS_DIRECT_LOAD = True
 
 #: ``prepare_lm_head_for_spyre`` pads the head on the host; see ``hf_llama``.
 SPYRE_DIRECT_HOST_MODULES = ("lm_head",)
+
+#: ``prepare_rope_and_heads`` pads attention on the host for granite-3.3-2b's
+#: head dim of 64; see ``hf_llama``.
+spyre_direct_stays_on_host = padded_attention_stays_on_host
 
 
 def _run_backbone_forward(

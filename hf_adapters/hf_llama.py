@@ -30,6 +30,7 @@ Usage::
 """
 
 from hf_adapters.hf_common import (
+    padded_attention_stays_on_host,
     prepare_standard_gqa,
     standard_gqa_backbone_forward,
     standard_gqa_forward,
@@ -39,12 +40,18 @@ _run_forward = standard_gqa_forward
 _run_backbone_forward = standard_gqa_backbone_forward
 
 #: Opt in to ``load_model_common(direct_to_device=True)``. ``prepare_for_spyre``
-#: here only rewrites blocks and reads parameter shapes, and the RoPE cache is
-#: built from the non-persistent ``inv_freq`` buffer, which never travels
-#: through the checkpoint loader and so is still on the host when
-#: ``prebuild_rope_cache`` runs. Covered by
+#: here rewrites blocks and reads parameter shapes, and the RoPE cache is built
+#: from the non-persistent ``inv_freq`` buffer, which never travels through the
+#: checkpoint loader and so is still on the host when ``prebuild_rope_cache``
+#: runs. The weights it does rebuild -- the LM head, and the attention
+#: projections when the head dim needs padding -- are kept on the host by
+#: ``SPYRE_DIRECT_HOST_MODULES`` and ``spyre_direct_stays_on_host``. Covered by
 #: ``tests/spyre/test_direct_load_compare_spyre.py``.
 SPYRE_SUPPORTS_DIRECT_LOAD = True
+
+#: ``pad_attention_heads`` rebuilds q/k/v/o on the host when the head dim is not
+#: a multiple of ``2 * BLOCK_SIZE`` (e.g. TinyLlama's 64), so those stay there.
+spyre_direct_stays_on_host = padded_attention_stays_on_host
 
 #: ``pad_lm_head`` rebuilds the head weight with ``F.pad`` during
 #: ``prepare_for_spyre``. On an already-transferred weight that pad would run as

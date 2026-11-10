@@ -21,6 +21,7 @@ end-to-end check that the weights land correctly lives in
 ``tests/spyre/test_direct_load_compare_spyre.py``.
 """
 
+import os
 import threading
 from types import SimpleNamespace
 
@@ -322,6 +323,46 @@ def test_an_adapter_without_the_flag_does_not_opt_in():
     assert not supports_direct_load(hf_bert)
 
 
+# ── attention that prep pads on the host ───────────────────────────────
+
+
+def test_padded_attention_stays_on_host_only_when_prep_will_pad_it():
+    from transformers import LlamaConfig
+
+    from hf_adapters.hf_common import padded_attention_stays_on_host
+
+    padded = SimpleNamespace(config=_tiny_config(tied=False))  # head_dim 4
+    aligned = SimpleNamespace(
+        config=LlamaConfig(
+            hidden_size=512, num_attention_heads=4, num_key_value_heads=2
+        )
+    )  # head_dim 128
+
+    assert padded_attention_stays_on_host(
+        padded, "model.layers.0.self_attn.q_proj.weight"
+    )
+    assert padded_attention_stays_on_host(
+        padded, "model.layers.1.self_attn.o_proj.weight"
+    )
+    assert not padded_attention_stays_on_host(
+        padded, "model.layers.0.mlp.gate_proj.weight"
+    )
+    assert not padded_attention_stays_on_host(
+        padded, "model.layers.0.self_attn.rotary_emb.inv_freq"
+    )
+    assert not padded_attention_stays_on_host(
+        aligned, "model.layers.0.self_attn.q_proj.weight"
+    )
+
+
+def test_llama_and_granite_hold_back_attention_that_prep_pads():
+    from hf_adapters.hf_common import padded_attention_stays_on_host
+    from hf_adapters.spyre_direct_load import _host_filter
+
+    for module in (hf_llama, hf_granite):
+        assert _host_filter(module) is padded_attention_stays_on_host
+
+
 # ── the context manager ────────────────────────────────────────────────
 
 
@@ -481,6 +522,42 @@ def test_exception_inside_the_block_still_restores():
         with spyre_direct_placement(device="spyre:0", dtype=torch.float16):
             raise RuntimeError("load failed")
     assert core_model_loading.set_param_for_module is original
+
+
+def test_read_ahead_is_turned_off_inside_the_block(monkeypatch):
+    """Workers must not hold converted copies while the card is still transferring."""
+    key = "HF_DEACTIVATE_ASYNC_LOAD"
+    monkeypatch.delenv(key, raising=False)
+    with spyre_direct_placement(device="cpu", dtype=torch.float16):
+        assert os.environ[key] == "1"
+    assert key not in os.environ
+
+
+def test_read_ahead_env_is_restored_when_the_caller_had_set_it(monkeypatch):
+    key = "HF_DEACTIVATE_ASYNC_LOAD"
+    monkeypatch.setenv(key, "0")
+    with spyre_direct_placement(device="cpu", dtype=torch.float16):
+        assert os.environ[key] == "1"
+    assert os.environ[key] == "0"
+
+
+def test_nested_blocks_restore_read_ahead_once(monkeypatch):
+    key = "HF_DEACTIVATE_ASYNC_LOAD"
+    monkeypatch.delenv(key, raising=False)
+    with spyre_direct_placement(device="cpu", dtype=torch.float16):
+        with spyre_direct_placement(device="cpu", dtype=torch.float16):
+            assert os.environ[key] == "1"
+        assert os.environ[key] == "1"
+    assert key not in os.environ
+
+
+def test_exception_inside_the_block_still_restores_read_ahead(monkeypatch):
+    key = "HF_DEACTIVATE_ASYNC_LOAD"
+    monkeypatch.delenv(key, raising=False)
+    with pytest.raises(RuntimeError):
+        with spyre_direct_placement(device="cpu", dtype=torch.float16):
+            raise RuntimeError("load failed")
+    assert key not in os.environ
 
 
 # ── wiring in load_model_common ────────────────────────────────────────
@@ -707,3 +784,29 @@ def test_a_real_load_routes_every_parameter_and_preserves_values(
         name for name in reference if not torch.equal(actual[name], reference[name])
     ]
     assert not differing, differing
+
+
+def test_padded_attention_is_left_on_the_host_in_a_real_load(
+    record_copies, tiny_checkpoint
+):
+    """q/k/v/o that prep will pad must reach Transformers as host tensors.
+
+    The tiny checkpoint's head dim is 4, which ``prepare_rope_and_heads`` pads
+    by slice-copying into new host tensors, so only the MLP projections may be
+    placed directly.
+    """
+    from transformers import AutoModelForCausalLM
+
+    with spyre_direct_placement(
+        device="cpu",
+        dtype=torch.float16,
+        host_modules=("lm_head",),
+        host_filter=hf_llama.spyre_direct_stays_on_host,
+    ):
+        AutoModelForCausalLM.from_pretrained(
+            tiny_checkpoint, dtype=torch.float16, device_map="cpu"
+        )
+
+    linear_shapes = [shape for name, shape, _dtype in record_copies if name == "linear"]
+    # Two layers of gate (32, 16), up (32, 16) and down (16, 32); no attention.
+    assert sorted(linear_shapes) == sorted([(32, 16), (32, 16), (16, 32)] * 2)

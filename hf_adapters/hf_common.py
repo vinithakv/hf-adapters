@@ -2593,6 +2593,7 @@ def _maybe_direct_placement(adapter_module, dtype, requested):
     for wrong results.
     """
     from hf_adapters.spyre_direct_load import (
+        _host_filter,
         _host_module_prefixes,
         spyre_direct_placement,
         supports_direct_load,
@@ -2618,6 +2619,7 @@ def _maybe_direct_placement(adapter_module, dtype, requested):
             device=DEVICE,
             dtype=dtype,
             host_modules=_host_module_prefixes(adapter_module),
+            host_filter=_host_filter(adapter_module),
         ),
     ):
         yield
@@ -2649,8 +2651,13 @@ def load_model_common(
             to HF's ``from_pretrained``) so checkpoints shipping custom modeling
             code load only when the caller explicitly opts in.
         direct_to_device: Transfer each weight to Spyre as it is materialized
-            instead of staging the whole model on the host first, which caps
-            peak host RSS at one parameter (see ``spyre_direct_load``). Opt-in,
+            instead of staging converted copies of the whole model on the host
+            (see ``spyre_direct_load``). Caps peak *anonymous* host memory at
+            one parameter plus whatever the adapter holds back, by also turning
+            off Transformers' checkpoint read-ahead for the duration of the
+            load. The saving is for dtype-converting loads (e.g. fp16 from a
+            bf16 checkpoint); when the load dtype matches the checkpoint the
+            staged path already mmap's and anonymous memory is similar. Opt-in,
             and only honored by adapters that set
             ``SPYRE_SUPPORTS_DIRECT_LOAD``. Not available with ``tp_plan``: the
             TP styles already load shard-by-shard onto the device.
@@ -4117,6 +4124,46 @@ def encoder_backbone_forward(model, input_ids, attn_mask, position_ids, token_ty
     return h
 
 
+def rope_padded_head_dim(cfg) -> int | None:
+    """Head dim ``prepare_rope_and_heads`` pads attention to, or ``None`` if it won't.
+
+    The RoPE reshape ``[B, L, H, 2, D/2]`` requires ``D/2 >= BLOCK_SIZE``, so the
+    head dim is rounded up to the next multiple of ``2 * BLOCK_SIZE``.
+    """
+    orig_head_dim = (
+        getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
+    )
+    stick_aligned_head_dim = (
+        (orig_head_dim + 2 * BLOCK_SIZE - 1) // (2 * BLOCK_SIZE)
+    ) * (2 * BLOCK_SIZE)
+    return stick_aligned_head_dim if stick_aligned_head_dim > orig_head_dim else None
+
+
+_PADDED_ATTENTION_PROJECTIONS = frozenset({"q_proj", "k_proj", "v_proj", "o_proj"})
+
+
+def padded_attention_stays_on_host(model, target_name) -> bool:
+    """Direct-load host rule for adapters whose prep runs ``pad_attention_heads``.
+
+    ``pad_attention_heads`` rebuilds ``self_attn.{q,k,v,o}_proj`` on the host.
+    A projection already on the device is first read back with
+    ``proj.to("cpu")``, which is lossy for fp16 (DLFLOAT16 on the device), and
+    the padded result is then transferred a second time by the final model move.
+    Keeping these weights on the host avoids both. Adapters that call
+    ``prepare_rope_and_heads`` expose this as ``spyre_direct_stays_on_host``.
+    """
+    if rope_padded_head_dim(text_config(model.config)) is None:
+        return False
+    parts = target_name.split(".")
+    try:
+        attn_at = parts.index("self_attn")
+    except ValueError:
+        return False
+    return (
+        attn_at + 1 < len(parts) and parts[attn_at + 1] in _PADDED_ATTENTION_PROJECTIONS
+    )
+
+
 def prepare_rope_and_heads(model):
     cfg = text_config(model.config)
     orig_head_dim = (
@@ -4137,14 +4184,8 @@ def prepare_rope_and_heads(model):
         )
     model._spyre_decode_mask_num_heads = local_query_heads
 
-    # RoPE reshape [B,L,H,2,D/2] requires D/2 >= BLOCK_SIZE.
-    # Compute minimum stick-aligned head_dim: round up to next multiple of 2*BLOCK_SIZE.
-    padded_head_dim = None
-    stick_aligned_head_dim = (
-        (orig_head_dim + 2 * BLOCK_SIZE - 1) // (2 * BLOCK_SIZE)
-    ) * (2 * BLOCK_SIZE)
-    if stick_aligned_head_dim > orig_head_dim:
-        padded_head_dim = stick_aligned_head_dim
+    padded_head_dim = rope_padded_head_dim(cfg)
+    if padded_head_dim is not None:
         pad_attention_heads(
             model,
             get_backbone(model).layers,

@@ -14,18 +14,36 @@
 
 """Opt-in direct-to-device checkpoint loading for Spyre.
 
-The default path stages the whole model on the host and then transfers it:
-``load_model_common(device_map="cpu")`` followed by ``model.to("spyre")``
-(see ``_move_to_spyre_with_layout``). Peak host RSS is therefore the size of
-the full checkpoint, and every weight is written twice.
+The default path is ``load_model_common(device_map="cpu")`` followed by
+``model.to("spyre")`` (see ``_move_to_spyre_with_layout``). For a
+dtype-converting load that stages a full host copy of every weight; when
+the load dtype matches the checkpoint, Transformers already mmap's and
+that copy is not made.
 
 This module keeps Transformers' checkpoint slices lazy on the host and
 transfers each parameter the moment it reaches its *final* name and target
-module. Peak host residency becomes one parameter at a time, plus whatever the
-adapter declares in ``SPYRE_DIRECT_HOST_MODULES`` -- today the LM head, which
-``pad_lm_head`` has to pad on the host. For a model whose head is a large
-fraction of its weights the saving is correspondingly smaller, so measure
-rather than assume.
+module. Peak *anonymous* host memory is then one parameter at a time, plus
+whatever the adapter holds back (``SPYRE_DIRECT_HOST_MODULES`` and
+``spyre_direct_stays_on_host``) -- today the LM head, which ``pad_lm_head``
+has to pad on the host, and attention projections ``pad_attention_heads``
+rebuilds when the head dim is not stick-aligned.
+
+That saving is for *dtype-converting* loads. When the load dtype matches the
+checkpoint, Transformers already hands out views into the memory-mapped file
+and the staged path is cheap; measured on Granite 3.3 8B in bf16, anonymous
+memory was 1.03 GiB either way. Loading that same checkpoint as fp16, the
+staged path held a full converted copy (16.5 GiB anonymous) and this path,
+with Transformers' 4-thread read-ahead turned off for the duration, held
+1.36 GiB -- the leftover is the tied embedding kept on the host. Load time
+did not change. File-backed pages of the mmap stay resident until the
+loader drops its references; those pages are reclaimable, unlike the
+anonymous copies.
+
+The read-ahead is ``HF_DEACTIVATE_ASYNC_LOAD``. Without it the workers
+produce converted host copies faster than the card consumes them (9.5 GiB
+anonymous on the same fp16 load). The variable is process-wide, so a
+concurrent ordinary load in another thread would also run without
+read-ahead for that window; that is a speed matter, not a correctness one.
 
 Hook point
 ----------
@@ -71,9 +89,13 @@ already on the device: the prep step is documented as operating on the CPU
 model, and RoPE caches in particular must be built on the host (see
 ``prebuild_rope_cache``). ``SPYRE_DIRECT_HOST_MODULES`` is the escape hatch for
 modules that must stay on the host through prep; they are transferred later by
-the ordinary ``model.to(device)``.
+the ordinary ``model.to(device)``. When that depends on the config, the adapter
+provides ``spyre_direct_stays_on_host(model, target_name)`` instead -- e.g. the
+attention projections ``pad_attention_heads`` rebuilds when the head dim is not
+stick-aligned.
 """
 
+import os
 import threading
 from collections.abc import Sequence
 from contextlib import contextmanager
@@ -93,6 +115,12 @@ __all__ = [
 _patch_lock = threading.Lock()
 _patch_depth = 0
 _original_set_param_for_module = None
+# Previous ``HF_DEACTIVATE_ASYNC_LOAD`` value, or ``_UNSET`` if it was absent.
+# Restored when the last nested block exits. Transformers reads the variable
+# once per load, at the start of ``convert_and_load_state_dict_in_model``.
+_UNSET = object()
+_ASYNC_LOAD_ENV = "HF_DEACTIVATE_ASYNC_LOAD"
+_async_load_env_saved = _UNSET
 
 # The installed wrapper is shared, but its *settings* are not: each thread
 # loading a model has its own device and dtype (rank-local under torchrun).
@@ -119,6 +147,15 @@ def _host_module_prefixes(adapter_module) -> tuple[str, ...]:
     if isinstance(declared, str):
         return (declared,)
     return tuple(str(prefix) for prefix in declared)
+
+
+def _host_filter(adapter_module):
+    """The adapter's ``spyre_direct_stays_on_host(model, target_name)``, if any.
+
+    For host residency that depends on the config, which a fixed
+    ``SPYRE_DIRECT_HOST_MODULES`` cannot express.
+    """
+    return getattr(adapter_module, "spyre_direct_stays_on_host", None)
 
 
 def _stays_on_host(target_name: str, host_prefixes: Sequence[str]) -> bool:
@@ -270,7 +307,7 @@ def _should_place(
 
 
 @contextmanager
-def spyre_direct_placement(*, device, dtype, host_modules=()):
+def spyre_direct_placement(*, device, dtype, host_modules=(), host_filter=None):
     """Place each loaded parameter straight onto Spyre as it is materialized.
 
     Args:
@@ -285,6 +322,9 @@ def spyre_direct_placement(*, device, dtype, host_modules=()):
         host_modules: Dotted module paths to leave on the host (adapters that
             keep submodules on CPU, and anything whose prep must run on the
             host). The ordinary ``model.to(device)`` transfers them afterwards.
+        host_filter: Optional ``(model, target_name) -> bool``; ``True`` keeps
+            that parameter on the host. Consulted after ``host_modules``, for
+            residency that depends on the model's config.
 
     Only active inside the ``with`` block, so a process that never loads a
     model pays nothing -- in particular ``transformers`` is imported here and
@@ -293,17 +333,25 @@ def spyre_direct_placement(*, device, dtype, host_modules=()):
     Safe to nest and to enter from several threads at once: the installed
     wrapper is shared, but the device, dtype and host modules it uses are
     per-thread, and a thread outside any direct-load block is unaffected.
+
+    Also sets ``HF_DEACTIVATE_ASYNC_LOAD=1`` for the duration, so Transformers
+    does not read every checkpoint tensor into a host copy on worker threads
+    before this funnel can transfer them. Restored (including "unset") when
+    the last nested block exits.
     """
-    global _patch_depth, _original_set_param_for_module
+    global _patch_depth, _original_set_param_for_module, _async_load_env_saved
 
     from transformers import core_model_loading
 
-    settings = (torch.device(device), dtype, tuple(host_modules))
+    settings = (torch.device(device), dtype, tuple(host_modules), host_filter)
 
     with _patch_lock:
         if _patch_depth == 0:
             _original_set_param_for_module = core_model_loading.set_param_for_module
             core_model_loading.set_param_for_module = _spyre_set_param_for_module
+            previous = os.environ.get(_ASYNC_LOAD_ENV)
+            _async_load_env_saved = _UNSET if previous is None else previous
+            os.environ[_ASYNC_LOAD_ENV] = "1"
         _patch_depth += 1
 
     stack = getattr(_active, "stack", None)
@@ -320,6 +368,13 @@ def spyre_direct_placement(*, device, dtype, host_modules=()):
             if _patch_depth == 0:
                 core_model_loading.set_param_for_module = _original_set_param_for_module
                 _original_set_param_for_module = None
+                saved = _async_load_env_saved
+                _async_load_env_saved = _UNSET
+                if saved is _UNSET:
+                    os.environ.pop(_ASYNC_LOAD_ENV, None)
+                else:
+                    assert isinstance(saved, str)
+                    os.environ[_ASYNC_LOAD_ENV] = saved
 
 
 def _spyre_set_param_for_module(
@@ -341,14 +396,18 @@ def _spyre_set_param_for_module(
     settings = _active_settings()
     placed = param_value
     if settings is not None:
-        device, dtype, host_prefixes = settings
-        if _should_place(
-            target_name,
-            param_value,
-            distributed_operation,
-            hf_quantizer,
-            host_prefixes,
-        ) and not _tied_to_host(model, target_name, host_prefixes):
+        device, dtype, host_prefixes, host_filter = settings
+        if (
+            _should_place(
+                target_name,
+                param_value,
+                distributed_operation,
+                hf_quantizer,
+                host_prefixes,
+            )
+            and not _tied_to_host(model, target_name, host_prefixes)
+            and not (host_filter is not None and host_filter(model, target_name))
+        ):
             module, param_name = _resolve_target_module(model, target_name)
             if module is not None:
                 placed = _placement_copy(
