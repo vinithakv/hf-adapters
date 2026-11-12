@@ -2595,6 +2595,7 @@ def _maybe_direct_placement(adapter_module, dtype, requested):
     from hf_adapters.spyre_direct_load import (
         _host_filter,
         _host_module_prefixes,
+        default_upload_threads,
         spyre_direct_placement,
         supports_direct_load,
     )
@@ -2620,6 +2621,7 @@ def _maybe_direct_placement(adapter_module, dtype, requested):
             dtype=dtype,
             host_modules=_host_module_prefixes(adapter_module),
             host_filter=_host_filter(adapter_module),
+            upload_threads=default_upload_threads(DEVICE),
         ),
     ):
         yield

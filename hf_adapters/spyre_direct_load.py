@@ -22,28 +22,35 @@ that copy is not made.
 
 This module keeps Transformers' checkpoint slices lazy on the host and
 transfers each parameter the moment it reaches its *final* name and target
-module. Peak *anonymous* host memory is then one parameter at a time, plus
-whatever the adapter holds back (``SPYRE_DIRECT_HOST_MODULES`` and
-``spyre_direct_stays_on_host``) -- today the LM head, which ``pad_lm_head``
-has to pad on the host, and attention projections ``pad_attention_heads``
-rebuilds when the head dim is not stick-aligned.
+module. On Spyre the transfers run on torch-spyre's upload threads, as
+``model.to``'s do, while loading continues, and at most
+``max_in_flight_bytes`` (1 GiB by default) of host tensors wait for them.
+Peak *anonymous* host memory is then that, plus whatever the adapter holds
+back (``SPYRE_DIRECT_HOST_MODULES`` and ``spyre_direct_stays_on_host``) --
+today the LM head, which ``pad_lm_head`` has to pad on the host, and
+attention projections ``pad_attention_heads`` rebuilds when the head dim is
+not stick-aligned.
 
 That saving is for *dtype-converting* loads. When the load dtype matches the
 checkpoint, Transformers already hands out views into the memory-mapped file
 and the staged path is cheap; measured on Granite 3.3 8B in bf16, anonymous
-memory was 1.03 GiB either way. Loading that same checkpoint as fp16, the
-staged path held a full converted copy (16.5 GiB anonymous) and this path,
-with Transformers' 4-thread read-ahead turned off for the duration, held
-1.36 GiB -- the leftover is the tied embedding kept on the host. Load time
-did not change. File-backed pages of the mmap stay resident until the
-loader drops its references; those pages are reclaimable, unlike the
+memory was about the same either way. Loading that same checkpoint as fp16,
+the staged path held a full converted copy (16.9 GiB anonymous at peak) and
+this path 2.7 GiB, against 1.7 GiB for the bf16 load, which converts
+nothing; the difference is the tied embedding kept on the host and converted
+weights waiting for the upload threads. Both fp16 loads took 10.5 s.
+Uploading one weight at a time, the direct load took 32.5 s, because
+``model.to`` uploads on several threads; the upload threads close that gap.
+File-backed pages of the mmap stay resident until
+the loader drops its references; those pages are reclaimable, unlike the
 anonymous copies.
 
 The read-ahead is ``HF_DEACTIVATE_ASYNC_LOAD``. Without it the workers
-produce converted host copies faster than the card consumes them (9.5 GiB
-anonymous on the same fp16 load). The variable is process-wide, so a
-concurrent ordinary load in another thread would also run without
-read-ahead for that window; that is a speed matter, not a correctness one.
+produce converted host copies faster than the card consumes them (15.8 GiB
+anonymous on the same fp16 load), and the load is no faster. The variable is
+process-wide, so a concurrent ordinary load in another thread would also run
+without read-ahead for that window; that is a speed matter, not a
+correctness one.
 
 Hook point
 ----------
@@ -95,15 +102,20 @@ attention projections ``pad_attention_heads`` rebuilds when the head dim is not
 stick-aligned.
 """
 
+import dataclasses
 import os
 import threading
-from collections.abc import Sequence
+import warnings
+from collections.abc import Callable, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
+from typing import NamedTuple
 
 import torch
 import torch.nn as nn
 
 __all__ = [
+    "default_upload_threads",
     "spyre_direct_placement",
     "supports_direct_load",
 ]
@@ -122,6 +134,12 @@ _UNSET = object()
 _ASYNC_LOAD_ENV = "HF_DEACTIVATE_ASYNC_LOAD"
 _async_load_env_saved = _UNSET
 
+# Bytes of host tensors handed to the upload threads and not yet swapped in,
+# above which the funnel waits for one to finish before taking the next. Enough
+# to keep every upload thread busy on an 8B model's largest projections (about
+# 100 MiB each in fp16), and small next to the model itself.
+_DEFAULT_MAX_IN_FLIGHT_BYTES = 1 << 30
+
 # The installed wrapper is shared, but its *settings* are not: each thread
 # loading a model has its own device and dtype (rank-local under torchrun).
 # Keeping them in a thread-local stack means a concurrent load cannot inherit
@@ -130,8 +148,32 @@ _async_load_env_saved = _UNSET
 _active = threading.local()
 
 
-def _active_settings():
-    """Settings for the direct-load block this thread is inside, if any."""
+class _InFlight(NamedTuple):
+    """One upload running on the block's pool, and where its result goes."""
+
+    future: Future
+    module: nn.Module
+    name: str
+    installed: torch.Tensor  # what ``set_param_for_module`` put in the module
+    nbytes: int
+
+
+@dataclasses.dataclass
+class _Block:
+    """One direct-load block: its settings and the uploads still in flight."""
+
+    device: torch.device
+    dtype: torch.dtype
+    host_prefixes: tuple[str, ...]
+    host_filter: Callable | None
+    pool: ThreadPoolExecutor | None
+    max_in_flight_bytes: int
+    pending: list[_InFlight] = dataclasses.field(default_factory=list)
+    in_flight_bytes: int = 0
+
+
+def _active_block() -> _Block | None:
+    """The direct-load block this thread is inside, if any."""
     stack = getattr(_active, "stack", None)
     return stack[-1] if stack else None
 
@@ -306,8 +348,114 @@ def _should_place(
     return not _stays_on_host(target_name, host_prefixes)
 
 
+def default_upload_threads(device) -> int:
+    """Upload threads for a direct load onto ``device``: as many as ``model.to``.
+
+    That is torch-spyre's count, which follows torch's intra-op threads, so
+    ``OMP_NUM_THREADS=1`` uploads one weight at a time. 1 off Spyre, and for a
+    Spyre device given without an index, since each thread has to be told its
+    device.
+    """
+    device = torch.device(device)
+    if device.type != "spyre" or device.index is None:
+        return 1
+    from torch_spyre.model_utils import _upload_thread_count
+
+    return int(_upload_thread_count(None))
+
+
+def _upload_pool(device: torch.device, upload_threads: int):
+    """Threads for one block's uploads, or ``None`` to upload on the caller.
+
+    On Spyre each thread is set up the way torch-spyre sets up ``model.to``'s:
+    the device and a stream of its own, so the uploads do not queue behind one
+    another on one stream.
+    """
+    if upload_threads <= 1:
+        return None
+    if device.type != "spyre":
+        return ThreadPoolExecutor(
+            max_workers=upload_threads, thread_name_prefix="spyre-direct-upload"
+        )
+    if device.index is None:
+        raise ValueError(f"upload threads need a device index, got {device}")
+    from torch_spyre.model_utils import _start_upload_thread
+
+    return ThreadPoolExecutor(
+        max_workers=upload_threads,
+        thread_name_prefix="spyre-direct-upload",
+        initializer=_start_upload_thread,
+        initargs=(device.index,),
+    )
+
+
+def _installed_tensor(module, name):
+    """The parameter or buffer ``set_param_for_module`` left at ``name``."""
+    if name in module._parameters:
+        return module._parameters[name]
+    return module._buffers.get(name)
+
+
+def _swap_in(item: _InFlight, device_tensor: torch.Tensor) -> None:
+    """Put an uploaded tensor in place of the host one Transformers installed.
+
+    As ``torch_spyre.model_utils._put_upload`` does for ``model.to``, a
+    parameter keeps its Python object: whatever already holds it, including a
+    tie Transformers makes after the weights load, sees the device tensor, and
+    attributes such as ``_is_hf_initialized`` stay on it. Nothing changes if
+    the attribute no longer holds the tensor that was installed.
+    """
+    module, name, installed = item.module, item.name, item.installed
+    if module._buffers.get(name) is installed:
+        module._buffers[name] = device_tensor
+        return
+    param = module._parameters.get(name)
+    if param is not installed:
+        return
+    new = nn.Parameter(device_tensor, requires_grad=param.requires_grad)
+    try:
+        torch._C._swap_tensor_impl(param, new)
+    except RuntimeError as e:
+        warnings.warn(
+            f"direct load: could not keep {name!r} as the same object ({e}); "
+            "replacing it, so a holder outside the module keeps the host tensor",
+            stacklevel=2,
+        )
+        new._is_hf_initialized = getattr(  # type: ignore[attr-defined]
+            param, "_is_hf_initialized", False
+        )
+        module._parameters[name] = new
+
+
+def _drain(block: _Block, limit: int) -> None:
+    """Swap in finished uploads, waiting while over ``limit`` bytes are in flight.
+
+    A ``limit`` below zero waits for every upload. An upload that failed raises
+    here, on the loading thread.
+    """
+    while block.pending:
+        done = [item for item in block.pending if item.future.done()]
+        if not done:
+            if block.in_flight_bytes <= limit:
+                return
+            wait([item.future for item in block.pending], return_when=FIRST_COMPLETED)
+            continue
+        for item in done:
+            block.pending.remove(item)
+            block.in_flight_bytes -= item.nbytes
+            _swap_in(item, item.future.result())
+
+
 @contextmanager
-def spyre_direct_placement(*, device, dtype, host_modules=(), host_filter=None):
+def spyre_direct_placement(
+    *,
+    device,
+    dtype,
+    host_modules=(),
+    host_filter=None,
+    upload_threads=1,
+    max_in_flight_bytes=_DEFAULT_MAX_IN_FLIGHT_BYTES,
+):
     """Place each loaded parameter straight onto Spyre as it is materialized.
 
     Args:
@@ -325,14 +473,24 @@ def spyre_direct_placement(*, device, dtype, host_modules=(), host_filter=None):
         host_filter: Optional ``(model, target_name) -> bool``; ``True`` keeps
             that parameter on the host. Consulted after ``host_modules``, for
             residency that depends on the model's config.
+        upload_threads: Threads that upload weights while loading continues.
+            1 (the default) uploads on the caller, one weight at a time;
+            ``default_upload_threads(device)`` matches ``model.to``.
+        max_in_flight_bytes: Host bytes handed to the upload threads and not
+            yet swapped in, above which loading waits for an upload to finish.
+            This bounds the host memory the threads add.
 
     Only active inside the ``with`` block, so a process that never loads a
     model pays nothing -- in particular ``transformers`` is imported here and
     not at ``import torch`` time.
 
     Safe to nest and to enter from several threads at once: the installed
-    wrapper is shared, but the device, dtype and host modules it uses are
-    per-thread, and a thread outside any direct-load block is unaffected.
+    wrapper is shared, but the device, dtype, host modules and upload threads
+    it uses belong to one block on one thread, and a thread outside any
+    direct-load block is unaffected.
+
+    Every upload is swapped in before the block exits. If the block exits with
+    an exception, uploads not yet started are cancelled.
 
     Also sets ``HF_DEACTIVATE_ASYNC_LOAD=1`` for the duration, so Transformers
     does not read every checkpoint tensor into a host copy on worker threads
@@ -343,7 +501,15 @@ def spyre_direct_placement(*, device, dtype, host_modules=(), host_filter=None):
 
     from transformers import core_model_loading
 
-    settings = (torch.device(device), dtype, tuple(host_modules), host_filter)
+    device = torch.device(device)
+    block = _Block(
+        device=device,
+        dtype=dtype,
+        host_prefixes=tuple(host_modules),
+        host_filter=host_filter,
+        pool=_upload_pool(device, upload_threads),
+        max_in_flight_bytes=max_in_flight_bytes,
+    )
 
     with _patch_lock:
         if _patch_depth == 0:
@@ -357,12 +523,17 @@ def spyre_direct_placement(*, device, dtype, host_modules=(), host_filter=None):
     stack = getattr(_active, "stack", None)
     if stack is None:
         stack = _active.stack = []
-    stack.append(settings)
+    stack.append(block)
 
     try:
         yield
+        _drain(block, -1)
     finally:
         stack.pop()
+        if block.pool is not None:
+            # Waits for running uploads, which hold their host tensors, and
+            # drops the rest; only after a failure is anything left here.
+            block.pool.shutdown(wait=True, cancel_futures=True)
         with _patch_lock:
             _patch_depth -= 1
             if _patch_depth == 0:
@@ -387,42 +558,78 @@ def _spyre_set_param_for_module(
     *args,
     **kwargs,
 ):
-    """Transfer the tensor to Spyre, then hand it to Transformers to install.
+    """Transfer the tensor to Spyre and have Transformers install it.
 
     Transformers keeps every other responsibility: ``set_param_for_module``
     still resolves the module, wraps parameters and records loading info. All
-    this does is decide the tensor's device and layout first.
+    this does is decide the tensor's device and layout.
+
+    Without upload threads, the tensor is transferred first and the device
+    tensor is installed. With them, the host tensor is installed, so that
+    bookkeeping runs as it would on the host, and an upload thread transfers
+    it while loading continues; ``_drain`` swaps the result in.
     """
-    settings = _active_settings()
-    placed = param_value
-    if settings is not None:
-        device, dtype, host_prefixes, host_filter = settings
-        if (
-            _should_place(
-                target_name,
-                param_value,
-                distributed_operation,
-                hf_quantizer,
-                host_prefixes,
+
+    def install(value):
+        return _original_set_param_for_module(
+            model,
+            target_name,
+            value,
+            loading_info,
+            distributed_operation,
+            hf_quantizer,
+            *args,
+            **kwargs,
+        )
+
+    block = _active_block()
+    if block is None:
+        return install(param_value)
+    if block.pool is not None:
+        _drain(block, block.max_in_flight_bytes)
+    if not (
+        _should_place(
+            target_name,
+            param_value,
+            distributed_operation,
+            hf_quantizer,
+            block.host_prefixes,
+        )
+        and not _tied_to_host(model, target_name, block.host_prefixes)
+        and not (
+            block.host_filter is not None and block.host_filter(model, target_name)
+        )
+    ):
+        return install(param_value)
+    module, param_name = _resolve_target_module(model, target_name)
+    if module is None:
+        return install(param_value)
+
+    if block.pool is None:
+        return install(
+            _placement_copy(
+                module, param_name, param_value, device=block.device, dtype=block.dtype
             )
-            and not _tied_to_host(model, target_name, host_prefixes)
-            and not (host_filter is not None and host_filter(model, target_name))
-        ):
-            module, param_name = _resolve_target_module(model, target_name)
-            if module is not None:
-                placed = _placement_copy(
-                    module, param_name, param_value, device=device, dtype=dtype
-                )
-    return _original_set_param_for_module(
-        model,
-        target_name,
-        placed,
-        loading_info,
-        distributed_operation,
-        hf_quantizer,
-        *args,
-        **kwargs,
+        )
+
+    result = install(param_value)
+    installed = _installed_tensor(module, param_name)
+    if installed is None or installed.device.type != "cpu":
+        # Not installed (a shape mismatch leaves the placeholder) or not ours.
+        return result
+    future = block.pool.submit(
+        _placement_copy,
+        module,
+        param_name,
+        param_value,
+        device=block.device,
+        dtype=block.dtype,
     )
+    nbytes = param_value.numel() * param_value.element_size()
+    block.pending.append(_InFlight(future, module, param_name, installed, nbytes))
+    block.in_flight_bytes += nbytes
+    _drain(block, block.max_in_flight_bytes)
+    return result
 
 
 _spyre_set_param_for_module._spyre_direct_placement = True  # type: ignore[attr-defined]

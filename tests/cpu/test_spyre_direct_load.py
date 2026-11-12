@@ -23,6 +23,7 @@ end-to-end check that the weights land correctly lives in
 
 import os
 import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -810,3 +811,203 @@ def test_padded_attention_is_left_on_the_host_in_a_real_load(
     linear_shapes = [shape for name, shape, _dtype in record_copies if name == "linear"]
     # Two layers of gate (32, 16), up (32, 16) and down (16, 32); no attention.
     assert sorted(linear_shapes) == sorted([(32, 16), (32, 16), (16, 32)] * 2)
+
+
+# ── upload threads ─────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def record_threaded_copies(monkeypatch):
+    """Recorders that return a new tensor and note the thread they ran on.
+
+    Returns a list of ``(helper, shape, thread name, result)``. A new tensor,
+    unlike ``record_copies``' pass-through, shows whether the result was
+    swapped into the module or the host tensor was left in place.
+    """
+    calls = []
+    lock = threading.Lock()
+
+    def _recorder(name):
+        def _copy(shard, *, device, dtype):
+            result = (shard.to(dtype) if dtype is not None else shard).clone()
+            with lock:
+                calls.append(
+                    (name, tuple(shard.shape), threading.current_thread().name, result)
+                )
+            return result
+
+        return _copy
+
+    import hf_adapters.spyre_tensor_parallel as tp
+
+    for helper in ("linear", "embedding", "default"):
+        monkeypatch.setattr(tp, f"_copy_{helper}", _recorder(helper))
+    return calls
+
+
+def _load_tiny(path):
+    from transformers import AutoModelForCausalLM
+
+    return AutoModelForCausalLM.from_pretrained(
+        path, dtype=torch.float16, device_map="cpu"
+    )
+
+
+def test_upload_threads_place_every_weight_in_a_real_load(
+    record_threaded_copies, tiny_checkpoint
+):
+    """Uploads run on the block's threads and every result is swapped in.
+
+    Each placed parameter must end up holding the tensor its upload returned,
+    so nothing still holds the host copy, and the values must match a plain
+    load.
+    """
+    reference = dict(_load_tiny(tiny_checkpoint).named_parameters())
+
+    with spyre_direct_placement(
+        device="cpu",
+        dtype=torch.float16,
+        host_modules=("lm_head",),
+        upload_threads=4,
+    ):
+        loaded = _load_tiny(tiny_checkpoint)
+
+    assert record_threaded_copies, "the real loader never reached the wrapper"
+    threads = {thread for _, _, thread, _ in record_threaded_copies}
+    assert all(name.startswith("spyre-direct-upload") for name in threads), threads
+
+    uploaded = {result.data_ptr() for *_, result in record_threaded_copies}
+    actual = dict(loaded.named_parameters())
+    swapped_in = sorted(name for name, p in actual.items() if p.data_ptr() in uploaded)
+    assert swapped_in == sorted(name for name in actual if name != "lm_head.weight")
+
+    differing = [n for n in reference if not torch.equal(actual[n], reference[n])]
+    assert not differing, differing
+
+
+def test_a_swapped_in_upload_keeps_the_parameter_object():
+    """Whatever holds the parameter -- a tie, made before or after -- sees it."""
+    from hf_adapters.spyre_direct_load import _InFlight, _swap_in
+
+    linear = nn.Linear(4, 2)
+    held = linear.weight
+    held._is_hf_initialized = True
+    uploaded = torch.full((2, 4), 7.0)
+
+    _swap_in(_InFlight(None, linear, "weight", held, 0), uploaded)
+
+    assert linear.weight is held
+    assert torch.equal(held, uploaded)
+    assert held._is_hf_initialized
+    assert held.requires_grad
+
+
+def test_an_uploaded_buffer_replaces_the_host_buffer():
+    from hf_adapters.spyre_direct_load import _InFlight, _swap_in
+
+    module = nn.Module()
+    module.register_buffer("ids", torch.zeros(3, dtype=torch.long))
+    uploaded = torch.ones(3, dtype=torch.long)
+
+    _swap_in(_InFlight(None, module, "ids", module.ids, 0), uploaded)
+
+    assert module.ids is uploaded
+
+
+def test_an_upload_is_dropped_if_the_attribute_was_replaced():
+    """Something else installed a new tensor meanwhile; it must not be undone."""
+    from hf_adapters.spyre_direct_load import _InFlight, _swap_in
+
+    linear = nn.Linear(4, 2)
+    old = linear.weight
+    replacement = nn.Parameter(torch.zeros(2, 4))
+    linear.weight = replacement
+
+    _swap_in(_InFlight(None, linear, "weight", old, 0), torch.ones(2, 4))
+
+    assert linear.weight is replacement
+    assert torch.equal(replacement, torch.zeros(2, 4))
+
+
+def test_in_flight_host_bytes_stay_within_the_limit(
+    record_threaded_copies, tiny_checkpoint, monkeypatch
+):
+    """After every hand-off the bytes awaiting upload are at most the limit.
+
+    The limit is what bounds the host memory the threads add. A tensor larger
+    than the limit is still uploaded, alone: the funnel waits for it.
+    """
+    import hf_adapters.spyre_direct_load as direct_load
+
+    in_flight_after = []
+    original_drain = direct_load._drain
+
+    def _drain(block, limit):
+        original_drain(block, limit)
+        if limit >= 0:
+            in_flight_after.append(block.in_flight_bytes)
+
+    monkeypatch.setattr(direct_load, "_drain", _drain)
+    # Each MLP projection is 32 x 16 fp16 = 1 KiB; the embedding is 2 KiB.
+    limit = 1024
+    with spyre_direct_placement(
+        device="cpu",
+        dtype=torch.float16,
+        upload_threads=4,
+        max_in_flight_bytes=limit,
+    ):
+        _load_tiny(tiny_checkpoint)
+
+    assert in_flight_after
+    assert max(in_flight_after) <= limit
+
+
+def test_a_failed_upload_fails_the_load_and_restores_everything(
+    monkeypatch, tiny_checkpoint
+):
+    import hf_adapters.spyre_tensor_parallel as tp
+
+    def _broken(shard, *, device, dtype):
+        raise RuntimeError("DMA failed")
+
+    for helper in ("linear", "embedding", "default"):
+        monkeypatch.setattr(tp, f"_copy_{helper}", _broken)
+    monkeypatch.delenv("HF_DEACTIVATE_ASYNC_LOAD", raising=False)
+    original = core_model_loading.set_param_for_module
+
+    with pytest.raises(RuntimeError, match="DMA failed"):
+        with spyre_direct_placement(
+            device="cpu", dtype=torch.float16, upload_threads=2
+        ):
+            _load_tiny(tiny_checkpoint)
+
+    assert core_model_loading.set_param_for_module is original
+    assert "HF_DEACTIVATE_ASYNC_LOAD" not in os.environ
+
+
+def test_only_an_indexed_device_gets_upload_threads_by_default():
+    from hf_adapters.spyre_direct_load import default_upload_threads
+
+    assert default_upload_threads("cpu") == 1
+    # Each upload thread has to be told its device, so an index is required.
+    assert default_upload_threads("spyre") == 1
+
+
+def test_load_model_common_uploads_on_as_many_threads_as_model_to(monkeypatch):
+    import hf_adapters.spyre_direct_load as direct_load
+    from hf_adapters.hf_common import _maybe_direct_placement
+
+    captured = {}
+
+    @contextmanager
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        yield
+
+    monkeypatch.setattr(direct_load, "default_upload_threads", lambda device: 6)
+    monkeypatch.setattr(direct_load, "spyre_direct_placement", _capture)
+
+    with _maybe_direct_placement(hf_llama, torch.float16, True):
+        pass
+
+    assert captured["upload_threads"] == 6
