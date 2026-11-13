@@ -74,7 +74,14 @@ def _device_state(model):
             param.device.type == "spyre"
         ), f"{name} is on {param.device}, not Spyre, after loading"
         layout = get_spyre_tensor_layout(param)
-        snapshot[name] = (param.detach().cpu(), tuple(layout.device_size))
+        snapshot[name] = (
+            param.detach().cpu(),
+            (
+                tuple(layout.device_size),
+                tuple(layout.stride_map),
+                layout.device_dtype,
+            ),
+        )
     return snapshot
 
 
@@ -114,6 +121,10 @@ def test_direct_load_matches_cpu_staged_load(
     gc.collect()
 
     direct = _load(model_path, direct=True, trust_remote_code=trust_remote_code)
+    # Without this the test would pass with both loads staged.
+    assert (
+        getattr(direct, "_spyre_direct_placed", 0) > 0
+    ), "direct_to_device=True placed no weights; the load was staged"
     direct_state = _device_state(direct)
     direct_tokens = _greedy_tokens(direct, model_path, trust_remote_code)
 

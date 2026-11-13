@@ -2586,6 +2586,8 @@ def _prefer_exact_tp_plan_entries():
 def _maybe_direct_placement(adapter_module, dtype, requested):
     """Enable direct-to-device placement when the adapter has opted in.
 
+    Yields the placement block, or ``None`` when the load is staged.
+
     A request for an adapter that has not opted in warns and loads the ordinary
     CPU-staged way rather than failing: the opt-in tracks whether that
     adapter's ``prepare_for_spyre`` has been verified against weights that are
@@ -2601,7 +2603,7 @@ def _maybe_direct_placement(adapter_module, dtype, requested):
     )
 
     if not requested:
-        yield
+        yield None
         return
     if not supports_direct_load(adapter_module):
         warnings.warn(
@@ -2609,7 +2611,7 @@ def _maybe_direct_placement(adapter_module, dtype, requested):
             "set SPYRE_SUPPORTS_DIRECT_LOAD. Loading via the host instead.",
             stacklevel=3,
         )
-        yield
+        yield None
         return
 
     with (
@@ -2622,9 +2624,19 @@ def _maybe_direct_placement(adapter_module, dtype, requested):
             host_modules=_host_module_prefixes(adapter_module),
             host_filter=_host_filter(adapter_module),
             upload_threads=default_upload_threads(DEVICE),
-        ),
+        ) as block,
     ):
-        yield
+        yield block
+    if block is not None and block.placed == 0:
+        # The load went through, so the model is correct, but it was staged on
+        # the host: Transformers never called the funnel this patch replaces.
+        warnings.warn(
+            "direct_to_device=True had no effect: no weight reached the "
+            "direct-placement funnel, so the model was loaded via the host. "
+            "Check that this Transformers version still installs weights "
+            "through core_model_loading.set_param_for_module.",
+            stacklevel=3,
+        )
 
 
 def load_model_common(
@@ -2655,14 +2667,17 @@ def load_model_common(
         direct_to_device: Transfer each weight to Spyre as it is materialized
             instead of staging converted copies of the whole model on the host
             (see ``spyre_direct_load``). Caps peak *anonymous* host memory at
-            one parameter plus whatever the adapter holds back, by also turning
-            off Transformers' checkpoint read-ahead for the duration of the
-            load. The saving is for dtype-converting loads (e.g. fp16 from a
+            what waits for the upload threads (about 1 GiB) plus whatever the
+            adapter holds back, by also turning off Transformers' checkpoint
+            read-ahead for the duration of the load. The saving is for dtype-converting loads (e.g. fp16 from a
             bf16 checkpoint); when the load dtype matches the checkpoint the
             staged path already mmap's and anonymous memory is similar. Opt-in,
             and only honored by adapters that set
-            ``SPYRE_SUPPORTS_DIRECT_LOAD``. Not available with ``tp_plan``: the
-            TP styles already load shard-by-shard onto the device.
+            ``SPYRE_SUPPORTS_DIRECT_LOAD``; an adapter with its own
+            ``load_hf_model`` loads the staged way, with a warning. Not
+            available with ``tp_plan``: the TP styles already load
+            shard-by-shard onto the device. After a direct load the model's
+            ``_spyre_direct_placed`` is the number of tensors placed.
 
     Raises:
         ValueError: If ``direct_to_device`` is combined with ``tp_plan``.
@@ -2680,6 +2695,12 @@ def load_model_common(
         auto_model_cls = AutoModel
 
     if hasattr(module, "load_hf_model"):
+        if direct_to_device:
+            warnings.warn(
+                f"direct_to_device=True ignored: {module.__name__} loads through "
+                "its own load_hf_model. Loading via the host instead.",
+                stacklevel=2,
+            )
         # _sig was already inspected above (for the tp_plan support check).
         # Re-inspect here to determine which optional kwargs this loader accepts.
         import inspect as _inspect
@@ -2714,7 +2735,7 @@ def load_model_common(
                 trust_remote_code=trust_remote_code,
             )
     else:
-        with _maybe_direct_placement(module, dtype, direct_to_device):
+        with _maybe_direct_placement(module, dtype, direct_to_device) as placement:
             # device_map stays "cpu": Transformers keeps the checkpoint slices
             # lazy on the host and the direct-placement wrapper transfers each
             # parameter at its final name. Asking HF for device_map="spyre"
@@ -2727,6 +2748,8 @@ def load_model_common(
                 device_map="cpu",
                 trust_remote_code=trust_remote_code,
             )
+        if placement is not None:
+            model._spyre_direct_placed = placement.placed
 
     model.eval()
     model.requires_grad_(False)

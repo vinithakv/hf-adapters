@@ -1011,3 +1011,147 @@ def test_load_model_common_uploads_on_as_many_threads_as_model_to(monkeypatch):
         pass
 
     assert captured["upload_threads"] == 6
+
+
+# ── review fixes ───────────────────────────────────────────────────────
+
+
+def test_a_tied_head_holds_back_its_embedding_once_it_is_loaded_too():
+    """The head leaving ``meta`` must not release the embedding.
+
+    A checkpoint that stores both keys fills the head first; Transformers
+    still ties the pair afterwards when their values match.
+    """
+    model = _tiny_causal_lm(tied=True, on_meta=False)
+    assert model.lm_head.weight.device.type != "meta"
+    assert _tied_to_host(model, "model.embed_tokens.weight", ("lm_head",))
+
+
+def test_a_tied_checkpoint_that_also_stores_the_head_stays_on_the_host(
+    record_copies, tmp_path
+):
+    """``.bin`` checkpoints store both keys of a tied pair.
+
+    The embedding must stay on the host there too: Transformers ties the head
+    to it after loading, so placing it would place the head.
+    """
+    from safetensors.torch import load_file, save_file
+    from transformers import AutoModelForCausalLM
+
+    path = tmp_path / "tied-llama-both-keys"
+    _tiny_causal_lm(tied=True).save_pretrained(path)
+    weights = path / "model.safetensors"
+    state = load_file(weights)
+    assert "lm_head.weight" not in state
+    state["lm_head.weight"] = state["model.embed_tokens.weight"].clone()
+    save_file(state, weights, metadata={"format": "pt"})
+
+    with spyre_direct_placement(
+        device="cpu", dtype=torch.float16, host_modules=("lm_head",)
+    ):
+        model = AutoModelForCausalLM.from_pretrained(
+            path, dtype=torch.float16, device_map="cpu"
+        )
+
+    assert model.lm_head.weight is model.model.embed_tokens.weight
+    helpers = [name for name, _shape, _dtype in record_copies]
+    assert "embedding" not in helpers, "the tied embedding was placed on the device"
+    assert "linear" in helpers
+
+
+def test_a_wrapper_looked_up_before_the_last_block_exits_still_installs():
+    """A plain load on another thread may call the wrapper after the restore."""
+    model = _ToyModel()
+    info = SimpleNamespace(
+        missing_keys=set(), unexpected_keys=set(), mismatched_keys=set()
+    )
+    with spyre_direct_placement(device="cpu", dtype=torch.float16):
+        looked_up = core_model_loading.set_param_for_module
+    assert core_model_loading.set_param_for_module is not looked_up
+
+    value = torch.full((32, 16), 3.0)
+    looked_up(model, "model.layers.0.q_proj.weight", value, info, None, None)
+
+    assert torch.equal(model.model.layers[0].q_proj.weight, value)
+
+
+@pytest.mark.parametrize("upload_threads", [1, 4])
+def test_the_block_counts_the_tensors_it_placed(
+    record_threaded_copies, tiny_checkpoint, upload_threads
+):
+    with spyre_direct_placement(
+        device="cpu",
+        dtype=torch.float16,
+        host_modules=("lm_head",),
+        upload_threads=upload_threads,
+    ) as block:
+        assert block.placed == 0
+        _load_tiny(tiny_checkpoint)
+
+    assert block.placed == len(record_threaded_copies) > 0
+
+
+def test_a_direct_load_that_places_nothing_warns(monkeypatch):
+    """The model is still right, but the caller asked for something else."""
+    import hf_adapters.spyre_direct_load as direct_load
+    from hf_adapters.hf_common import _maybe_direct_placement
+
+    @contextmanager
+    def _places_nothing(**kwargs):
+        yield SimpleNamespace(placed=0)
+
+    monkeypatch.setattr(direct_load, "default_upload_threads", lambda device: 1)
+    monkeypatch.setattr(direct_load, "spyre_direct_placement", _places_nothing)
+
+    with pytest.warns(UserWarning, match="had no effect"):
+        with _maybe_direct_placement(hf_llama, torch.float16, True):
+            pass
+
+
+def test_load_model_common_records_how_many_tensors_were_placed(
+    record_copies, tiny_checkpoint, monkeypatch
+):
+    import warnings
+
+    from transformers import AutoModelForCausalLM
+
+    from hf_adapters import hf_common
+
+    monkeypatch.setattr(hf_common, "DEVICE", "cpu")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        model = hf_common.load_model_common(
+            tiny_checkpoint,
+            hf_llama,
+            dtype=torch.float16,
+            auto_model_cls=AutoModelForCausalLM,
+            direct_to_device=True,
+        )
+
+    assert model._spyre_direct_placed == len(record_copies) > 0
+
+
+def test_a_staged_load_records_no_placement_count(tiny_checkpoint):
+    from transformers import AutoModelForCausalLM
+
+    from hf_adapters import hf_common
+
+    model = hf_common.load_model_common(
+        tiny_checkpoint,
+        hf_llama,
+        dtype=torch.float16,
+        auto_model_cls=AutoModelForCausalLM,
+    )
+
+    assert not hasattr(model, "_spyre_direct_placed")
+
+
+def test_direct_to_device_warns_for_an_adapter_with_its_own_loader():
+    from hf_adapters.hf_common import load_model_common
+
+    adapter = SimpleNamespace(
+        __name__="hf_adapters.hf_custom",
+        load_hf_model=lambda model_path, dtype: nn.Linear(2, 2),
+    )
+    with pytest.warns(UserWarning, match="load_hf_model"):
+        load_model_common("unused", adapter, direct_to_device=True)

@@ -124,6 +124,9 @@ __all__ = [
 # one process must not each install and restore their own copy. The lock guards
 # install/restore and the depth count makes the last one out restore exactly
 # once, so an inner block leaving never strands an outer one.
+# ``_original_set_param_for_module`` is kept after the last block exits: a load
+# on another thread may have looked the wrapper up just before, and its call
+# still has to reach Transformers.
 _patch_lock = threading.Lock()
 _patch_depth = 0
 _original_set_param_for_module = None
@@ -170,6 +173,9 @@ class _Block:
     max_in_flight_bytes: int
     pending: list[_InFlight] = dataclasses.field(default_factory=list)
     in_flight_bytes: int = 0
+    #: Tensors this block transferred (or handed to an upload thread). Zero
+    #: after a load means the funnel was never reached.
+    placed: int = 0
 
 
 def _active_block() -> _Block | None:
@@ -212,16 +218,6 @@ def _stays_on_host(target_name: str, host_prefixes: Sequence[str]) -> bool:
     return False
 
 
-def _lookup_param(model, dotted_name):
-    """Return the parameter or buffer at ``dotted_name``, or ``None`` if absent."""
-    module_path, _, attr = dotted_name.rpartition(".")
-    try:
-        owner = model.get_submodule(module_path) if module_path else model
-    except AttributeError:
-        return None
-    return getattr(owner, attr, None)
-
-
 def _tying_is_active(model) -> bool:
     """True when this model ties its output projection to its input embedding."""
     config = getattr(model, "config", None)
@@ -246,19 +242,21 @@ def _tied_to_host(model, target_name, host_prefixes: Sequence[str]) -> bool:
     readback, and for fp16 a lossy one (DLFLOAT16 on the device).
 
     Note the tie is **not** observable by identity here. Tying runs after the
-    weights land, so while this funnel is live the tied parameter is still the
-    meta placeholder and is not yet the same object as its source. The three
-    conditions below are what can be seen at placement time:
+    weights land, so while this funnel is live the tied parameter is not yet
+    the same object as its source. The two conditions below are what can be
+    seen at placement time:
 
     1. the model declares the pair in ``_tied_weights_keys`` -- which it does
        whether or not tying is switched on, so this alone is not enough;
-    2. ``tie_word_embeddings`` is set on the (text) config;
-    3. the tied parameter is still on ``meta``, i.e. nothing is going to fill
-       it from the checkpoint independently.
+    2. ``tie_word_embeddings`` is set on the (text) config.
 
-    Condition 3 also keeps the answer right if a checkpoint does carry its own
-    ``lm_head.weight``: that key arrives at this funnel on its own and is
-    skipped by the ordinary prefix check instead.
+    Whether the tied parameter has been filled from the checkpoint does not
+    matter. A checkpoint may carry its own ``lm_head.weight`` (``.bin``
+    checkpoints store both keys): that key is kept on the host by the prefix
+    check, and Transformers still ties the pair afterwards when the two hold
+    the same values, so the source has to stay on the host all the same. If
+    the values differ Transformers leaves them untied, and holding the source
+    back then only means ``model.to`` transfers it later.
     """
     tied_keys = getattr(model, "_tied_weights_keys", None)
     if not isinstance(tied_keys, dict) or not _tying_is_active(model):
@@ -268,10 +266,7 @@ def _tied_to_host(model, target_name, host_prefixes: Sequence[str]) -> bool:
     for tied_name, source_name in tied_keys.items():
         if source_name != target_name:
             continue
-        if not _stays_on_host(tied_name, host_prefixes):
-            continue
-        tied_param = _lookup_param(model, tied_name)
-        if tied_param is not None and tied_param.device.type == "meta":
+        if _stays_on_host(tied_name, host_prefixes):
             return True
     return False
 
@@ -492,6 +487,10 @@ def spyre_direct_placement(
     Every upload is swapped in before the block exits. If the block exits with
     an exception, uploads not yet started are cancelled.
 
+    Yields the block; its ``placed`` is how many tensors it transferred. Zero
+    after a load means Transformers never called the funnel, for example
+    because a new release installs weights some other way.
+
     Also sets ``HF_DEACTIVATE_ASYNC_LOAD=1`` for the duration, so Transformers
     does not read every checkpoint tensor into a host copy on worker threads
     before this funnel can transfer them. Restored (including "unset") when
@@ -526,7 +525,7 @@ def spyre_direct_placement(
     stack.append(block)
 
     try:
-        yield
+        yield block
         _drain(block, -1)
     finally:
         stack.pop()
@@ -538,7 +537,6 @@ def spyre_direct_placement(
             _patch_depth -= 1
             if _patch_depth == 0:
                 core_model_loading.set_param_for_module = _original_set_param_for_module
-                _original_set_param_for_module = None
                 saved = _async_load_env_saved
                 _async_load_env_saved = _UNSET
                 if saved is _UNSET:
@@ -606,11 +604,11 @@ def _spyre_set_param_for_module(
         return install(param_value)
 
     if block.pool is None:
-        return install(
-            _placement_copy(
-                module, param_name, param_value, device=block.device, dtype=block.dtype
-            )
+        placed = _placement_copy(
+            module, param_name, param_value, device=block.device, dtype=block.dtype
         )
+        block.placed += 1
+        return install(placed)
 
     result = install(param_value)
     installed = _installed_tensor(module, param_name)
@@ -628,6 +626,7 @@ def _spyre_set_param_for_module(
     nbytes = param_value.numel() * param_value.element_size()
     block.pending.append(_InFlight(future, module, param_name, installed, nbytes))
     block.in_flight_bytes += nbytes
+    block.placed += 1
     _drain(block, block.max_in_flight_bytes)
     return result
 
